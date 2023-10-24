@@ -487,6 +487,7 @@ class InstallLib(install_lib):
         
         self.git_exec = shutil.which("git")
         self.force = None
+        self.deps_dir = os.path.abspath(os.path.join(self.build_temp, "deps"))
         self.set_undefined_options('install', ('force', 'force'))
         print(f"self.force = {self.force}")
 
