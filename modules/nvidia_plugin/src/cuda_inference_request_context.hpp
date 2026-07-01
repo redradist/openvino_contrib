@@ -7,14 +7,17 @@
 #include <memory_manager/cuda_device_mem_block.hpp>
 
 #include "cancellation_token.hpp"
+#include "cuda_dynamic_buffer_context.hpp"
 #include "cuda_graph_context.hpp"
 #include "cuda_tensor_mapping_context.hpp"
 #include "cuda_thread_context.hpp"
+#include "cuda_variable_context.hpp"
 
 namespace ov {
 namespace nvidia_gpu {
 
 class IExecutionDelegator;
+class DynamicOperationCache;
 
 class InferenceRequestContext {
 public:
@@ -32,12 +35,14 @@ public:
                             CancellationToken& token,
                             IExecutionDelegator& executionDelegator,
                             CudaGraphContext& cudaGraphContext,
+                            DynamicOperationCache& dynamicShapeCache,
                             bool isBenchmarkMode = false)
         : threadContext{threadContext},
           token{token},
           executionDelegator{executionDelegator},
           tensor_mapping_context_{inputs, inputMapping, outputs, outputMapping},
           cuda_graph_context_{cudaGraphContext},
+          dynamic_op_cache_{dynamicShapeCache},
           is_benchmark_mode_{isBenchmarkMode} {}
 
     // don't allow storing references to temporary
@@ -69,6 +74,20 @@ public:
         return *current_cuda_graph_info_;
     }
 
+    [[nodiscard]] DynamicBufferContext& getDynamicBufferContext() { return dynamic_buffer_context_; }
+    [[nodiscard]] const DynamicBufferContext& getDynamicBufferContext() const { return dynamic_buffer_context_; }
+
+    [[nodiscard]] DynamicOperationCache& getDynamicOperationCache() { return dynamic_op_cache_; }
+
+    // Variable (KV-cache) state for stateful models. Set by CudaInferRequest
+    // before execution; absent for stateless models.
+    void setVariableContext(CudaVariableContext& ctx) { variable_context_ = &ctx; }
+    [[nodiscard]] bool hasVariableContext() const { return variable_context_ != nullptr; }
+    [[nodiscard]] CudaVariableContext& getVariableContext() const {
+        OPENVINO_ASSERT(variable_context_, "VariableContext is not set");
+        return *variable_context_;
+    }
+
 private:
     const ThreadContext& threadContext;
     CancellationToken& token;
@@ -77,6 +96,9 @@ private:
     CudaGraphContext& cuda_graph_context_;
     bool is_benchmark_mode_;
     ICudaGraphInfo* current_cuda_graph_info_ = nullptr;
+    DynamicOperationCache& dynamic_op_cache_;
+    DynamicBufferContext dynamic_buffer_context_;
+    CudaVariableContext* variable_context_ = nullptr;
 };
 
 }  // namespace nvidia_gpu

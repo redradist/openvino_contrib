@@ -50,8 +50,16 @@ CompiledModel::CompiledModel(const std::shared_ptr<const ov::Model>& model,
       config_(std::move(cfg)),
       cuda_stream_executor_(std::move(wait_executor)),
       loaded_from_cache_(loaded_from_cache),
+      // CUDA Graphs are incompatible with dynamic shapes. More importantly,
+      // CudaGraphTopologyRunner splits the model into several SubGraphs, each
+      // with its own OperationBuffersExtractor numbering BufferIDs from zero,
+      // while the per-request DynamicBufferContext/ShapeContext is shared across
+      // all SubGraphs — so for dynamic models the BufferID spaces collide and
+      // operations read buffers registered by a different SubGraph. Dynamic
+      // models therefore always use EagerTopologyRunner (single SubGraph,
+      // single consistent BufferID space).
       use_cuda_graph_{get_property(ov::nvidia_gpu::use_cuda_graph.name()).as<bool>() &&
-                      !get_property(ov::enable_profiling.name()).as<bool>()},
+                      !get_property(ov::enable_profiling.name()).as<bool>() && !model->is_dynamic()},
       number_of_cuda_graphs_{0} {
     try {
         compile_model(model);
@@ -98,9 +106,6 @@ void CompiledModel::compile_model(const std::shared_ptr<const ov::Model>& model)
     if (!loaded_from_cache_) {
         // Apply transformations pipeline
         transformer.transform(device, model_, config_);
-    }
-    if (model->is_dynamic()) {
-        throw_ov_exception("Dynamic models are not supported by NVIDIA plugin yet!");
     }
     // Generate backend specific blob mappings. For example Inference Engine uses not ov::Result nodes friendly name
     // as inference request output names but the name of the layer before.
@@ -232,20 +237,23 @@ unsigned int CompiledModel::run_benchmark_for(const int numInfers,
 
 size_t CompiledModel::get_optimal_number_of_streams(size_t const_blob_size,
                                                     size_t memory_blob_size) const {
-    if (memory_blob_size == 0) {
-        return 0;
-    }
     CUDA::Device device{config_.get_device_id()};
     device.setCurrent();
+    const size_t max_streams_supported = max_concurrent_streams(device);
+    const size_t num_streams = config_.get_optimal_number_of_streams();
+    if (memory_blob_size == 0) {
+        // Dynamic models allocate per-inference buffers via cudaMallocAsync,
+        // so no pre-allocated mutable memory block is needed. Still need at
+        // least one MemoryPool entry for the CudaGraphContext slot.
+        return std::min(max_streams_supported, num_streams);
+    }
     size_t free;
     [[maybe_unused]] size_t total;
     throwIfError(cudaMemGetInfo(&free, &total));
-    const size_t max_streams_supported = max_concurrent_streams(device);
     const auto available_infer_requests = (free - const_blob_size) / memory_blob_size;
     if (0 == available_infer_requests) {
         throw_ov_exception("Not enough memory even for single InferRequest!");
     }
-    const size_t num_streams = config_.get_optimal_number_of_streams();
     return std::min({max_streams_supported, available_infer_requests, num_streams});
 }
 
@@ -261,13 +269,14 @@ std::shared_ptr<MemoryPool> CompiledModel::create_memory_pool() {
 
 std::shared_ptr<ov::ISyncInferRequest> CompiledModel::create_benchmark_sync_infer_request() {
     return std::make_shared<CudaInferRequest>(
-        std::static_pointer_cast<const CompiledModel>(std::shared_ptr<CompiledModel>(this, [](CompiledModel*) {})));
+        std::static_pointer_cast<const CompiledModel>(std::shared_ptr<CompiledModel>(this, [](CompiledModel*) {})),
+        cuda_stream_executor_);
 }
 
 std::shared_ptr<ov::IAsyncInferRequest> CompiledModel::create_benchmark_infer_request() {
     auto internal_request = create_benchmark_sync_infer_request();
     return std::make_shared<CudaAsyncInferRequest>(
-        std::static_pointer_cast<CudaInferRequest>(std::move(internal_request)),
+        std::static_pointer_cast<CudaInferRequest>(internal_request),
         get_task_executor(),
         cuda_stream_executor_,
         get_callback_executor());
@@ -275,7 +284,8 @@ std::shared_ptr<ov::IAsyncInferRequest> CompiledModel::create_benchmark_infer_re
 
 std::shared_ptr<ov::ISyncInferRequest> CompiledModel::create_sync_infer_request() const {
     return std::make_shared<CudaInferRequest>(
-        std::static_pointer_cast<const CompiledModel>(shared_from_this()));
+        std::static_pointer_cast<const CompiledModel>(shared_from_this()),
+        cuda_stream_executor_);
 }
 
 std::shared_ptr<ov::IAsyncInferRequest> CompiledModel::create_infer_request() const {

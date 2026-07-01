@@ -20,6 +20,7 @@
 #include "cuda_plugin.hpp"
 #include "cuda_profiler.hpp"
 #include "cuda_simple_execution_delegator.hpp"
+#include "cuda_variable_state.hpp"
 #include "nvidia/properties.hpp"
 #include "openvino/runtime/make_tensor.hpp"
 #include "openvino/runtime/threading/executor_manager.hpp"
@@ -49,14 +50,22 @@ inline std::unique_ptr<IExecutionDelegator> create_execution_delegator(bool is_p
 
 }  // namespace
 
-CudaInferRequest::CudaInferRequest(const std::shared_ptr<const CompiledModel>& compiled_model)
+CudaInferRequest::CudaInferRequest(const std::shared_ptr<const CompiledModel>& compiled_model,
+                                   const std::shared_ptr<ov::threading::ITaskExecutor>& wait_executor)
     : ov::ISyncInferRequest(compiled_model),
       cancellation_token_{[this] { memory_proxy_.reset(); }},
+      wait_executor_{wait_executor},
       executionDelegator_{
           create_execution_delegator(compiled_model->get_property(ov::enable_profiling.name()).as<bool>(),
                                      compiled_model->get_topology_runner().GetSubGraph())},
       is_benchmark_mode_{compiled_model->get_property(ov::nvidia_gpu::operation_benchmark.name()).as<bool>()} {
     create_infer_request();
+
+    // Initialize variable states for stateful models (KV-cache, etc.).
+    for (const auto& variable : compiled_model->model_->get_variables()) {
+        auto state = std::make_shared<CudaVariableState>(variable->get_info());
+        variable_context_.register_variable(variable->get_info().variable_id, state);
+    }
 }
 
 void CudaInferRequest::create_infer_request() {
@@ -163,7 +172,11 @@ void CudaInferRequest::start_pipeline(const ThreadContext& threadContext) {
                                                     cancellation_token_,
                                                     *executionDelegator_,
                                                     cudaGraphContext,
+                                                    compiled_model->dynamic_op_cache_,
                                                     is_benchmark_mode_};
+        if (!variable_context_.empty()) {
+            inferRequestContext.setVariableContext(variable_context_);
+        }
         topology_runner.UpdateContext(inferRequestContext, memory);
         topology_runner.Run(inferRequestContext, memory);
         executionDelegator_->stop_stage(PerfStages::StartPipeline);
@@ -217,7 +230,27 @@ void CudaInferRequest::cancel() {
 }
 
 void CudaInferRequest::infer() {
-    OPENVINO_NOT_IMPLEMENTED;
+    {
+        OV_ITT_SCOPED_TASK(itt::domains::nvidia_gpu, "CudaInferRequest::infer_preprocess");
+        this->infer_preprocess();
+    }
+    auto cuda_thread_pool = std::dynamic_pointer_cast<CudaThreadPool>(wait_executor_);
+    OPENVINO_ASSERT(cuda_thread_pool, "wait_executor_ must be a CudaThreadPool");
+    wait_executor_->run_and_wait({[this, cuda_thread_pool] {
+        auto& threadContext = cuda_thread_pool->get_thread_context();
+        {
+            OV_ITT_SCOPED_TASK(itt::domains::nvidia_gpu, "CudaInferRequest::start_pipeline");
+            this->start_pipeline(threadContext);
+        }
+        {
+            OV_ITT_SCOPED_TASK(itt::domains::nvidia_gpu, "CudaInferRequest::wait_pipeline");
+            this->wait_pipeline(threadContext);
+        }
+    }});
+    {
+        OV_ITT_SCOPED_TASK(itt::domains::nvidia_gpu, "CudaInferRequest::infer_postprocess");
+        this->infer_postprocess();
+    }
 }
 
 std::shared_ptr<const CompiledModel> CudaInferRequest::get_nvidia_model() {
@@ -239,7 +272,7 @@ void CudaInferRequest::set_tensors_impl(const ov::Output<const ov::Node> port,
 }
 
 std::vector<ov::SoPtr<ov::IVariableState>> CudaInferRequest::query_state() const {
-    OPENVINO_NOT_IMPLEMENTED;
+    return variable_context_.query_states();
 }
 
 std::vector<ov::ProfilingInfo> CudaInferRequest::get_profiling_info() const {
