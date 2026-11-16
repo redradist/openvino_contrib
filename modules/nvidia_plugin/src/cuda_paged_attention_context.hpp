@@ -284,6 +284,7 @@ public:
         PagedAttentionMapping mapping;
         CUDA::Allocation slot_mapping;   ///< device copy of mapping.slot_mapping
         CUDA::Allocation row_to_subseq;  ///< device copy of mapping.row_to_subseq
+        CUDA::Allocation tiles;          ///< device copy of mapping.tiles
     };
 
     /// Identifies the scheduling inputs of a layer within one infer: the host tensors of
@@ -300,16 +301,20 @@ public:
 
     /// Uploads `mapping` to the device; the result is valid for the current infer.
     static std::unique_ptr<StepData> make_step_data(PagedAttentionMapping mapping, const CUDA::Stream& stream) {
-        const std::size_t bytes = std::max<std::size_t>(mapping.slot_mapping.size() * sizeof(int32_t), 1);
-        auto slot = stream.malloc(bytes);
-        auto r2s = stream.malloc(bytes);
-        auto data = std::unique_ptr<StepData>(new StepData{std::move(mapping), std::move(slot), std::move(r2s)});
-        const std::size_t n = data->mapping.slot_mapping.size() * sizeof(int32_t);
-        if (n) {
-            stream.upload(CUDA::DevicePointer<void*>{data->slot_mapping.get()}, data->mapping.slot_mapping.data(), n);
-            stream.upload(CUDA::DevicePointer<void*>{data->row_to_subseq.get()}, data->mapping.row_to_subseq.data(), n);
-        }
-        return data;
+        const auto upload = [&stream](const std::vector<int32_t>& v) {
+            const std::size_t bytes = v.size() * sizeof(int32_t);
+            auto alloc = stream.malloc(std::max<std::size_t>(bytes, 1));
+            if (bytes) {
+                stream.upload(CUDA::DevicePointer<void*>{alloc.get()}, v.data(), bytes);
+            }
+            return alloc;
+        };
+        auto slot = upload(mapping.slot_mapping);
+        auto r2s = upload(mapping.row_to_subseq);
+        auto tiles = upload(mapping.tiles);
+        // The host vectors are moved into the result, so they outlive the (pageable, staged) uploads.
+        return std::unique_ptr<StepData>(
+            new StepData{std::move(mapping), std::move(slot), std::move(r2s), std::move(tiles)});
     }
 
     /// The step data registered for `key` during the current infer, or nullptr.

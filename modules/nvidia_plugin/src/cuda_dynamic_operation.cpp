@@ -599,8 +599,14 @@ void DynamicOperation::executePagedAttention(const InferenceRequestContext& cont
     const PagedAttentionContext::StepData* step = host_metadata ? paCtx.find_step(step_key) : nullptr;
     if (!step) {
         auto data = PagedAttentionContext::make_step_data(
-            build_paged_attention_mapping(
-                num_tokens, block_size, readI32(0), readI32(1), readI32(2), readI32(3), num_cache_blocks),
+            build_paged_attention_mapping(num_tokens,
+                                          block_size,
+                                          readI32(0),
+                                          readI32(1),
+                                          readI32(2),
+                                          readI32(3),
+                                          num_cache_blocks,
+                                          kernel::kPagedAttentionTileRows),
             stream);
         if (host_metadata) {
             step = &paCtx.add_step(step_key, std::move(data));
@@ -680,6 +686,8 @@ void DynamicOperation::executePagedAttention(const InferenceRequestContext& cont
                             static_cast<const int32_t*>(inputPtr(5)),
                             static_cast<const int32_t*>(inputPtr(6)),
                             static_cast<const int32_t*>(step->row_to_subseq.get()),
+                            static_cast<const int32_t*>(step->tiles.get()),
+                            static_cast<int>(mapping.tiles.size() / 2),
                             alibi_ptr,
                             out_alloc.get(),
                             params,

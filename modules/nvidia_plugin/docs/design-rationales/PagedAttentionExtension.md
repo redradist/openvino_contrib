@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Native PagedAttentionExtension for the OpenVINO NVIDIA (CUDA) Plugin — Implementation Design
 
-Status: M0–M3 implemented; M4–M5 planned
+Status: M0–M3 implemented; M4 partially implemented (see §6); M5 planned
 Owner: NVIDIA plugin
 Target repo: `modules/nvidia_plugin`
 References cited inline as `path:line`. OpenVINO core = `.../OpenVINO`, genai = `.../openvino.genai`, plugin = `modules/nvidia_plugin`.
@@ -203,7 +203,7 @@ All 25 inputs arrive as **ordinary graph tensors** — no special I/O plumbing. 
 ### 4.5 KV cache in the memory model (the core problem)
 The cache is huge, mutable, persistent across steps, and **owned by genai as a host `ov::Tensor`** that genai resizes/copies/evicts itself. Naively, `key_cache.N` being a Parameter means generic `ParameterOp::Execute` would `upload()` multi-GB host→device every step and discard PA's device writes (`parameter.cpp:32`). Must special-case.
 
-**Implemented (M2) — the host tensor is the source of truth, the device keeps a persistent mirror** (`src/cuda_paged_attention_context.hpp`):
+**Implemented (M2, transfers reworked in M4) — the host tensor is the source of truth, the device keeps a persistent mirror** (`src/cuda_paged_attention_context.hpp`):
 
 On NVIDIA, genai allocates the caches as plain host tensors (its remote-tensor path is gated on device names containing "GPU"). Outside the model genai modifies them in exactly two places (genai `continuous_batching/scheduler.hpp`, `Scheduler::schedule()`, both before `infer()`):
 - **growth** (`CacheManager::allocate_cache_if_needed`): a bigger tensor is allocated, the old contents are copied into its leading blocks, and it is bound with `set_tensor`. With the default `SchedulerConfig` (`cache_size == 0 && num_kv_blocks == 0`) this happens repeatedly, by 8 blocks at a time;
@@ -212,11 +212,12 @@ On NVIDIA, genai allocates the caches as plain host tensors (its remote-tensor p
 Coherence invariant: *after every infer, every slot written by PagedAttention is identical on host and device.* It is maintained by:
 1. **No generic upload.** A cache Parameter consumed only by PagedAttention inputs 3/4 registers a 1-byte placeholder with its shape instead of uploading the whole cache every infer.
 2. **`bind()`** each infer: the device mirror is keyed by the cache-input BufferID; on growth it is reallocated (geometrically) and the old contents are copied device-to-device (the host copy genai made equals them by the invariant). The replaced buffer is released only after the stream is synchronized. A new or desynchronized mirror is seeded with a full upload.
-3. **Refresh before write.** Each block a step appends to at a non-zero in-block offset is re-uploaded from the host before `reshape_and_cache`: it may be a copy-on-write destination. The rule is stateless (it does not try to know whether genai copied), which is the only safe choice because block ids are recycled without the plugin seeing it. A block written from offset 0 needs no refresh.
-4. **Write-through.** Every block written by a step is downloaded back to the host tensor. The downloads are deferred to `CudaInferRequest::wait_pipeline` (after all kernels are enqueued, before the stream is synchronized), so they neither stall kernel launches nor let `infer()` return before the host is up to date.
-5. **Failure handling.** If an infer throws or is cancelled after some layers updated their mirrors, the context is marked desynchronized and every mirror is re-seeded from the host on the next bind.
+3. **Refresh before write.** The filled prefix (`past % block_size` slots of every head) of each block a step appends to at a non-zero in-block offset is re-uploaded from the host before `reshape_and_cache`: it may be a copy-on-write destination. The rule is stateless (it does not try to know whether genai copied), which is the only safe choice because block ids are recycled without the plugin seeing it. A block written from offset 0 needs no refresh.
+4. **Write-through.** The rows `reshape_and_cache` writes are exactly PagedAttention's key/value inputs, so the write-back does not read the device cache: each layer downloads its K and V input rows (one copy each) and `CudaInferRequest::wait_pipeline` scatters them into the host tensors at their slots after the stream is synchronized, before `infer()` returns.
+5. **Asynchronous transfers.** Both directions go through a page-locked staging arena (`PinnedArena`), so the copies never stall the stream; the arena is recycled after every infer.
+6. **Failure handling.** If an infer throws or is cancelled after some layers updated their mirrors, its stream is drained (the next infer of the request may run on another pool thread and stream), the pending write-back is dropped, and every mirror is re-seeded from the host on the next bind.
 
-Per step this transfers only the touched blocks (decode: one block per sequence per layer in each direction) instead of the whole cache. It relies on genai's write pattern above (verified at genai 933d76c); a future genai change that writes other blocks outside the model would need a matching refresh rule.
+Per step this transfers only the new rows and the filled part of the blocks being appended to (decode: one row per sequence per layer down, at most one partial block up) instead of the whole cache. It relies on genai's write pattern above (verified at genai 933d76c); a future genai change that writes other blocks outside the model would need a matching refresh rule.
 
 **Phase 4 (clean, zero-copy):** implement `create_context`/`get_default_context` + NVIDIA `RemoteTensor`/`RemoteContext`, make genai's `all_gpu_device` path fire so the cache is allocated directly in device memory — eliminates host↔device copies. Deferred.
 
@@ -261,7 +262,11 @@ Add `NvidiaConvertPagedAttnInputs`, mirroring OpenVINO `convert_pagedattn_inputs
 
   Note on sliding-window models: SDPAToPagedAttention recovers the window only from the Phi-3 mask pattern (verified with a Phi-3 exported by transformers 4.45) and from gpt-oss. With transformers 5.0 + optimum-intel 2.0, Phi-3, Mistral and Qwen2 (`use_sliding_window`) exports all get `sliding_window = 0` on *every* device, i.e. full causal attention; that is a converter limitation, not a plugin one. gpt-oss also needs attention sinks (input 20), which are not implemented yet.
 
-**M4 — Performance.** Two-pass flash-decoding, prefill tensor-core GEMM, shared-memory Q, coalesced layout. Success: throughput near a reference vLLM paged kernel; no correctness regression.
+**M4 — Performance.** Partially done. Measured with GenAI `LLMPipeline` on an RTX 4070 (f16 hint, greedy):
+- ✅ *Dynamic-shape operation cache* (plugin-wide): the per-shape operation cache held 300 entries for the whole model; GPT-2 with PA has ~600 dynamic operations, so every inference re-created every operation. Sized per operation now, O(1) LRU, device properties cached. Decode: GPT-2 87 → 23 ms/token, bloom-560m 214 → 38 ms/token.
+- ✅ *Host-side PA overhead*: scheduling metadata read from the host Parameters, slot mapping built and uploaded once per infer for all layers, row-granular asynchronous write-back and prefix-only refresh through pinned staging (§4.5).
+- ✅ *Tiled attention kernel*: one CTA per (≤16 query rows of a subsequence, head) shares each K/V cache block through shared memory; lane j scores key j, so a block costs two warp reductions per row. bloom-560m, warm shapes, ~2000-word prompt: TTFT 84 → 65–73 ms, decode at that context 62 → 33–36 ms/token (ranges: run-to-run spread; the host is a CPU-frequency-scaled i7-4770K). Slots a row cannot see are skipped, not weighted by 0: unwritten cache slots (e.g. the uninitialized tail of a grown mirror) may hold NaN. The previous one-warp-per-row kernel remains as a fallback when the device cannot provide the shared memory.
+- ⏳ *Remaining.* (1) The first prefill of a new prompt length costs 0.5–0.8 s because every dynamic operation is re-created for the new shapes (warm: ~40 ms) — plugin-wide dynamic-shape work, e.g. cheaper operation creation or shape bucketing. (2) Decode of small models is host-bound (~600 operations launched per token; on a CPU at full clock GPT-2 decodes in ~7 ms/token, ~2.5 ms of it GPU time) — CUDA graphs for repeated decode shapes would remove most of it. (3) Split-K flash-decoding for long contexts with few sequences, tensor-core `Q·Kᵀ` for long prefills.
 
 **M5 — Extensions & zero-copy (optional).** Quantized KV cache; score output; RemoteTensor device-resident cache.
 

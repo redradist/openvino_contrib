@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -70,17 +71,24 @@ struct Case {
     int num_heads, num_kv_heads, head_size, v_head_size, sliding_window;
     bool alibi;
     std::vector<int> q_lens, past;
+    int block_size = 32;  // != 32 runs the row-wise fallback kernel
 };
 
 double run_case(const Case& c) {
-    kernel::PagedAttentionParams p{c.num_heads,     c.num_kv_heads, c.head_size,      c.v_head_size, 32,
+    kernel::PagedAttentionParams p{c.num_heads,     c.num_kv_heads, c.head_size,      c.v_head_size, c.block_size,
                                    1.0f / std::sqrt((float)c.head_size), c.sliding_window, c.alibi};
     const int nseq = c.q_lens.size();
     std::vector<int> subseq_begins(nseq + 1, 0), past_lens(c.past), row_to_subseq;
     for (int i = 0; i < nseq; ++i) subseq_begins[i + 1] = subseq_begins[i] + c.q_lens[i];
     const int num_tokens = subseq_begins[nseq];
-    for (int i = 0; i < nseq; ++i)
+    std::vector<int> tiles;
+    for (int i = 0; i < nseq; ++i) {
         for (int j = 0; j < c.q_lens[i]; ++j) row_to_subseq.push_back(i);
+        for (int j = 0; j < c.q_lens[i]; j += kernel::kPagedAttentionTileRows) {
+            tiles.push_back(subseq_begins[i] + j);
+            tiles.push_back(i);
+        }
+    }
     std::vector<int> block_indices, block_indices_begins(nseq + 1, 0);
     int next_block = 0;
     for (int i = 0; i < nseq; ++i) {
@@ -89,8 +97,11 @@ double run_case(const Case& c) {
         block_indices_begins[i + 1] = block_indices.size();
     }
     const int num_blocks = next_block + 2;
-    std::vector<float> key_cache((size_t)num_blocks * c.num_kv_heads * p.block_size * c.head_size, 0.f);
-    std::vector<float> value_cache((size_t)num_blocks * c.num_kv_heads * p.block_size * c.v_head_size, 0.f);
+    // Slots that are never written hold NaN (like the uninitialized tail of a grown device
+    // cache): attention must not read them, not even multiplied by a zero weight.
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    std::vector<float> key_cache((size_t)num_blocks * c.num_kv_heads * p.block_size * c.head_size, nan);
+    std::vector<float> value_cache((size_t)num_blocks * c.num_kv_heads * p.block_size * c.v_head_size, nan);
     for (int i = 0; i < nseq; ++i)
         for (int pos = 0; pos < past_lens[i]; ++pos) {
             int bn = block_indices[block_indices_begins[i] + pos / p.block_size], off = pos % p.block_size;
@@ -122,7 +133,7 @@ double run_case(const Case& c) {
     const auto& ds = CUDA::DefaultStream::stream();
     CUDA::Stream cuda_stream{};
     auto stream = cuda_stream.get();
-    auto up = [&](const void* h, size_t bytes) {
+    const auto up = [&ds](const void* h, size_t bytes) {
         auto a = ds.malloc(std::max(bytes, size_t{1}));
         if (bytes) ds.upload(CUDA::DevicePointer<void*>{a.get()}, h, bytes);
         return a;
@@ -136,6 +147,7 @@ double run_case(const Case& c) {
     auto d_past = up(past_lens.data(), past_lens.size() * 4);
     auto d_sb = up(subseq_begins.data(), subseq_begins.size() * 4);
     auto d_r2s = up(row_to_subseq.data(), row_to_subseq.size() * 4);
+    auto d_tiles = up(tiles.data(), tiles.size() * 4);
     auto d_alibi = up(alibi.data(), alibi.size() * 4);
     auto d_out = ds.malloc((size_t)num_tokens * c.num_heads * c.v_head_size * 4);
 
@@ -145,8 +157,8 @@ double run_case(const Case& c) {
     kernel::paged_attention(stream, kernel::Type_t::f32, d_q.get(), d_kc.get(), d_vc.get(),
                             static_cast<const int32_t*>(d_bi.get()), static_cast<const int32_t*>(d_bib.get()),
                             static_cast<const int32_t*>(d_past.get()), static_cast<const int32_t*>(d_sb.get()),
-                            static_cast<const int32_t*>(d_r2s.get()),
-                            c.alibi ? static_cast<const float*>(d_alibi.get()) : nullptr, d_out.get(), p, num_tokens);
+                            static_cast<const int32_t*>(d_r2s.get()), static_cast<const int32_t*>(d_tiles.get()),
+                            static_cast<int>(tiles.size() / 2), c.alibi ? static_cast<const float*>(d_alibi.get()) : nullptr, d_out.get(), p, num_tokens);
 
     std::vector<float> out_gpu((size_t)num_tokens * c.num_heads * c.v_head_size);
     ds.download(out_gpu.data(), CUDA::DevicePointer<const void*>{d_out.get()}, out_gpu.size() * 4);
@@ -168,7 +180,11 @@ double run_case(const Case& c) {
     cpu_golden(query, kc2, vc2, block_indices, block_indices_begins, past_lens, subseq_begins, row_to_subseq, alibi,
                out_cpu, p, num_tokens);
     double maxdiff = 0;
-    for (size_t j = 0; j < out_cpu.size(); ++j) maxdiff = std::max(maxdiff, (double)std::abs(out_cpu[j] - out_gpu[j]));
+    for (size_t j = 0; j < out_cpu.size(); ++j) {
+        // std::max ignores NaN: report a non-finite output explicitly.
+        if (!std::isfinite(out_gpu[j])) return std::numeric_limits<double>::infinity();
+        maxdiff = std::max(maxdiff, (double)std::abs(out_cpu[j] - out_gpu[j]));
+    }
     return maxdiff;
 }
 
@@ -188,4 +204,12 @@ INSTANTIATE_TEST_SUITE_P(
                     Case{8, 8, 64, 32, 0, false, {1}, {6}},          // S != SV
                     Case{8, 8, 64, 64, 4, false, {1}, {20}},         // sliding window
                     Case{8, 8, 64, 64, 0, true, {1}, {12}},          // alibi
-                    Case{8, 2, 64, 64, 0, false, {1, 4, 1}, {33, 7, 0}}));  // batch
+                    Case{8, 2, 64, 64, 0, false, {1, 4, 1}, {33, 7, 0}},    // batch
+                    Case{4, 2, 64, 64, 0, false, {40}, {0}},                // prefill over 3 tiles
+                    Case{4, 4, 128, 128, 0, false, {37, 1, 17}, {50, 70, 0}},  // chunked prefill + decode
+                    Case{4, 4, 64, 64, 20, false, {45}, {10}},              // sliding window, prefill
+                    Case{4, 4, 64, 64, 0, true, {33}, {31}},                // alibi, prefill
+                    Case{2, 1, 256, 256, 0, false, {18}, {40}},             // head_size 256 (opt-in smem)
+                    Case{4, 4, 96, 80, 0, false, {20}, {5}},                // odd head sizes
+                    Case{4, 2, 64, 64, 0, false, {20, 1}, {3, 40}, 16},     // row-wise fallback
+                    Case{4, 4, 64, 64, 9, true, {1}, {30}, 16}));           // fallback, window + alibi

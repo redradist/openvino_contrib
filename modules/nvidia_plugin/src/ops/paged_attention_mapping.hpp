@@ -31,12 +31,16 @@ struct PagedAttentionMapping {
     std::vector<int32_t> refresh_blocks;
     /// Number of already-filled slots of each refresh_blocks entry (the prefix to refresh).
     std::vector<int32_t> refresh_filled;
+    /// Query tiles of the attention kernel, flattened [num_tiles][2]: first row, subsequence.
+    /// A tile covers up to `tile_rows` consecutive rows of one subsequence.
+    std::vector<int32_t> tiles;
 };
 
 
 /**
  * @brief Builds and validates the per-step mapping.
  * @param num_cache_blocks Number of blocks in the bound cache tensor (dim 0), or -1 if unknown.
+ * @param tile_rows        Maximum number of rows of one subsequence per query tile.
  * Throws on inconsistent metadata instead of reading or writing out of bounds.
  */
 inline PagedAttentionMapping build_paged_attention_mapping(int num_tokens,
@@ -45,8 +49,10 @@ inline PagedAttentionMapping build_paged_attention_mapping(int num_tokens,
                                                            const std::vector<int32_t>& subsequence_begins,
                                                            const std::vector<int32_t>& block_indices,
                                                            const std::vector<int32_t>& block_indices_begins,
-                                                           int64_t num_cache_blocks = -1) {
+                                                           int64_t num_cache_blocks = -1,
+                                                           int tile_rows = 1) {
     OPENVINO_ASSERT(block_size > 0, "PagedAttention: block_size must be positive");
+    OPENVINO_ASSERT(tile_rows > 0, "PagedAttention: tile_rows must be positive");
     OPENVINO_ASSERT(num_tokens >= 0, "PagedAttention: negative number of tokens");
     const int nseq = static_cast<int>(past_lens.size());
     OPENVINO_ASSERT(subsequence_begins.size() == static_cast<size_t>(nseq) + 1,
@@ -102,6 +108,10 @@ inline PagedAttentionMapping build_paged_attention_mapping(int num_tokens,
                     check_block(block_indices[b]);
                 }
             }
+        }
+        for (int row = row_begin; row < row_end; row += tile_rows) {
+            m.tiles.push_back(row);
+            m.tiles.push_back(i);
         }
         for (int row = row_begin; row < row_end; ++row) {
             m.row_to_subseq[row] = i;

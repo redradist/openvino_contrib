@@ -77,3 +77,10 @@ TEST(PagedAttentionMapping, InvalidMetadataThrows) {
     // block_indices_begins out of range.
     EXPECT_ANY_THROW(build_paged_attention_mapping(1, kBlock, V{0}, V{0, 1}, V{0}, V{0, 2}));
 }
+
+TEST(PagedAttentionMapping, QueryTilesStayWithinOneSubsequence) {
+    // seq 0: 5 rows, seq 1: none, seq 2: 2 rows; tiles of up to 2 rows.
+    const auto m = build_paged_attention_mapping(
+        7, kBlock, V{0, 3, 0}, V{0, 5, 5, 7}, V{0, 1, 2, 3}, V{0, 2, 3, 4}, -1, 2);
+    EXPECT_EQ(m.tiles, (V{0, 0, 2, 0, 4, 0, 5, 2}));
+}
