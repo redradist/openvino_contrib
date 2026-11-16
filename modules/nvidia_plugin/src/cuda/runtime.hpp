@@ -10,6 +10,8 @@
 #include <cuda/device_pointers.hpp>
 #include <error.hpp>
 #include <functional>
+#include <map>
+#include <mutex>
 
 #include "props.hpp"
 
@@ -67,7 +69,19 @@ public:
     explicit Device(int id) noexcept : id{id} {}
     static int currentId() { return createFirstArg(cudaGetDevice); }
     static int count() { return createFirstArg(cudaGetDeviceCount); }
-    cudaDeviceProp props() const { return createFirstArg(cudaGetDeviceProperties, id); }
+    /// Device properties. Queried once per device: cudaGetDeviceProperties is an ioctl that
+    /// costs ~1 ms, and operations query the properties in their constructors (which run per
+    /// input shape for dynamic models).
+    cudaDeviceProp props() const {
+        static std::mutex mutex;
+        static std::map<int, cudaDeviceProp> cache;
+        std::lock_guard<std::mutex> lock{mutex};
+        auto it = cache.find(id);
+        if (it == cache.end()) {
+            it = cache.emplace(id, createFirstArg(cudaGetDeviceProperties, id)).first;
+        }
+        return it->second;
+    }
     const Device& setCurrent() const {
         throwIfError(cudaSetDevice(id));
         return *this;

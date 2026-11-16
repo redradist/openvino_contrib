@@ -7,6 +7,7 @@
 #include <memory_manager/cuda_memory_manager.hpp>
 #include <ops/nop_op.hpp>
 #include <ops/subgraph.hpp>
+#include <algorithm>
 #include <utility>
 
 #include "cuda_compiled_model.hpp"
@@ -138,6 +139,13 @@ void CompiledModel::compile_model(const std::shared_ptr<const ov::Model>& model)
     } else {
         topology_runner_ = std::make_unique<EagerTopologyRunner>(creationContext, model_);
     }
+    // Size the shape cache of the dynamic operations so that one inference never evicts entries
+    // it is about to use again (see DynamicOperationCache).
+    const auto& exec_sequence = topology_runner_->GetSubGraph().getExecSequence();
+    const auto num_dynamic_ops = std::count_if(exec_sequence.begin(), exec_sequence.end(), [](const auto& op) {
+        return dynamic_cast<const DynamicOperation*>(op.get()) != nullptr;
+    });
+    dynamic_op_cache_.reserve(static_cast<size_t>(num_dynamic_ops));
 
     memory_pool_ = create_memory_pool();
 }

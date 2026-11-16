@@ -83,14 +83,38 @@ struct CachedOperation {
  * Shared across all DynamicOperation instances within a CompiledModel, so the
  * plugin holds a single bounded cache for the whole model instead of one cache
  * per operation. Uses a composite key (operation identity + input shapes/values)
- * and double-checked locking in getOrCreate(). Capacity 300 matches the Intel
- * GPU plugin (~1-2 entries per op for a typical model).
+ * and double-checked locking in getOrCreate().
+ *
+ * Every dynamic operation looks up its entry on every inference, so the capacity must cover
+ * all of them: with fewer entries than operations, an LRU cache evicts each entry right before
+ * it is needed again and every inference re-creates every operation. The compiled model
+ * therefore sizes the cache to kEntriesPerOperation entries per dynamic operation (see
+ * reserve()), which keeps several input shapes per operation (e.g. a decode step and a few
+ * prefill lengths of an LLM). The total stays bounded by max(kMinEntriesPerOperation entries
+ * per operation, kMaxCapacity).
  */
 class DynamicOperationCache {
 public:
     static constexpr size_t kDefaultCapacity = 300;
+    static constexpr size_t kEntriesPerOperation = 8;
+    static constexpr size_t kMinEntriesPerOperation = 2;
+    static constexpr size_t kMaxCapacity = 8192;
 
     explicit DynamicOperationCache(size_t capacity = kDefaultCapacity) : cache_{capacity} {}
+
+    /// Grows the capacity for a model with `num_operations` dynamic operations: kEntriesPerOperation
+    /// entries each, bounded by max(kMinEntriesPerOperation entries each, kMaxCapacity).
+    void reserve(size_t num_operations) {
+        const size_t bound = std::max(num_operations * kMinEntriesPerOperation, kMaxCapacity);
+        const size_t wanted = std::min(num_operations * kEntriesPerOperation, bound);
+        std::lock_guard<std::mutex> lock{mutex_};
+        cache_.set_capacity(std::max(cache_.capacity(), wanted));
+    }
+
+    size_t capacity() {
+        std::lock_guard<std::mutex> lock{mutex_};
+        return cache_.capacity();
+    }
 
     template <typename Factory>
     std::shared_ptr<CachedOperation> getOrCreate(const void* op_id, const ShapeKey& key, Factory factory) {
