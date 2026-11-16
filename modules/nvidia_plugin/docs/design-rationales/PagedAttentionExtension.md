@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Native PagedAttentionExtension for the OpenVINO NVIDIA (CUDA) Plugin — Implementation Design
 
-Status: M0–M2 implemented; M3–M5 planned
+Status: M0–M3 implemented; M4–M5 planned
 Owner: NVIDIA plugin
 Target repo: `modules/nvidia_plugin`
 References cited inline as `path:line`. OpenVINO core = `.../OpenVINO`, genai = `.../openvino.genai`, plugin = `modules/nvidia_plugin`.
@@ -257,7 +257,9 @@ Add `NvidiaConvertPagedAttnInputs`, mirroring OpenVINO `convert_pagedattn_inputs
 
 **M2 — Batched / mixed / continuous batching.** ✅ Row→subseq map; mixed prefill+decode; multi-subsequence block-table; host/device cache coherence for cache growth and copy-on-write (§4.5); validated scheduling metadata; loud errors for unsupported features (KV cache rotation/eviction scores, sinks, adaptive R-KV, quantized caches). Success: genai `ContinuousBatchingPipeline` and default `LLMPipeline` (prefix caching + dynamic cache growth, chat) on GPT-2 match the CPU plugin token-for-token, including beam search, parallel sampling, chunked prefill, vLLM-mode scheduling and late-arriving requests.
 
-**M3 — Feature completeness.** ALiBi, sliding_window. Success: an ALiBi model and a sliding-window model pass.
+**M3 — Feature completeness.** ✅ ALiBi, sliding_window (the kernel only visits the last `sliding_window` positions). Both arrive as small constant subgraphs (`Reshape` of the slopes for Bloom, `2 - offset` for Phi-3) and are folded at compile time. Success: bigscience/bloom-560m (ALiBi) and a tiny random Phi-3 (`optimum-intel-internal-testing/tiny-random-Phi3ForCausalLM`, `sliding_window` set to 16, i.e. a 17-token window in PA) match the CPU plugin token-for-token in all GenAI E2E scenarios listed for M2.
+
+  Note on sliding-window models: SDPAToPagedAttention recovers the window only from the Phi-3 mask pattern (verified with a Phi-3 exported by transformers 4.45) and from gpt-oss. With transformers 5.0 + optimum-intel 2.0, Phi-3, Mistral and Qwen2 (`use_sliding_window`) exports all get `sliding_window = 0` on *every* device, i.e. full causal attention; that is a converter limitation, not a plugin one. gpt-oss also needs attention sinks (input 20), which are not implemented yet.
 
 **M4 — Performance.** Two-pass flash-decoding, prefill tensor-core GEMM, shared-memory Q, coalesced layout. Success: throughput near a reference vLLM paged kernel; no correctness regression.
 

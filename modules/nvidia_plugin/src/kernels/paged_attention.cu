@@ -96,8 +96,9 @@ __global__ void paged_attention_kernel(const T* __restrict__ query,
     for (int t = 0; t < kMaxPerLane; ++t) acc[t] = 0.0f;
 
     const int blk_begin = block_indices_begins[i];
-    for (int pcur = 0; pcur < cur_kv_len; ++pcur) {
-        if (p.sliding_window > 0 && pcur < cur_kv_len - p.sliding_window) continue;
+    // With a sliding window only the last `sliding_window` positions are attended to.
+    const int first_pos = (p.sliding_window > 0) ? max(0, cur_kv_len - p.sliding_window) : 0;
+    for (int pcur = first_pos; pcur < cur_kv_len; ++pcur) {
         const int bn = block_indices[blk_begin + pcur / BS];
         if (bn < 0) continue;
         const int off = pcur % BS;

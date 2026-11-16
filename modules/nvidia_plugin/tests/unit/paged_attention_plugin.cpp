@@ -18,6 +18,8 @@
 #include "openvino/op/constant.hpp"
 #include "openvino/op/paged_attention.hpp"
 #include "openvino/op/parameter.hpp"
+#include "openvino/op/reshape.hpp"
+#include "openvino/op/subtract.hpp"
 #include "openvino/runtime/iasync_infer_request.hpp"
 #include "openvino/runtime/make_tensor.hpp"
 
@@ -44,8 +46,14 @@ std::shared_ptr<ov::op::v0::Constant> constant(ov::element::Type type, const ov:
     return std::make_shared<ov::op::v0::Constant>(type, shape, v);
 }
 
+/// Optional attention features of the PagedAttention node.
+struct Features {
+    int32_t sliding_window = 0;  ///< 0 = attend to the whole context
+    Vec alibi_slopes;            ///< one slope per head, or empty
+};
+
 /// The model SDPAToPagedAttention would produce for one attention layer.
-std::shared_ptr<ov::Model> make_model() {
+std::shared_ptr<ov::Model> make_model(const Features& f = {}) {
     const auto dyn = ov::Dimension::dynamic();
     auto q = param(ov::element::f32, {dyn, kHidden}, "q");
     auto k = param(ov::element::f32, {dyn, kHidden}, "k");
@@ -69,8 +77,14 @@ std::shared_ptr<ov::Model> make_model() {
         block_indices,
         block_indices_begins,
         constant<float>(f32, {}, {1.0f / std::sqrt(static_cast<float>(kHeadSize))}),  // scale
-        constant<int32_t>(i32, {}, {0}),                                               // sliding_window
-        constant<float>(f32, {0}, {}),                                                 // alibi_slopes
+        // sliding_window and alibi_slopes are subgraphs, like SDPAToPagedAttention emits them
+        // (e.g. `2 - offset` for Phi-3, a Reshape of the slopes for Bloom).
+        std::make_shared<ov::op::v1::Subtract>(constant<int32_t>(i32, {}, {2}),
+                                               constant<int32_t>(i32, {}, {2 - f.sliding_window})),
+        std::make_shared<ov::op::v1::Reshape>(
+            constant<float>(f32, {f.alibi_slopes.size()}, f.alibi_slopes),
+            constant<int64_t>(ov::element::i64, {1}, {static_cast<int64_t>(f.alibi_slopes.size())}),
+            false),
         constant<int32_t>(i32, {}, {1024}),                                            // max_context_len
         constant<int32_t>(i32, {}, {0}),     // score_aggregation_window
         constant<int32_t>(i32, {0}, {}),     // rotated_block_indices
@@ -104,22 +118,27 @@ Vec random_token(std::mt19937& rng) {
     return v;
 }
 
-/// Attention of one query token over the given key/value tokens (all visible).
-Vec reference_attention(const Vec& q, const std::vector<Vec>& keys, const std::vector<Vec>& values) {
+/// Attention of the last of `keys.size()` tokens over the given key/value tokens (causal: all
+/// visible, unless a sliding window hides the older ones).
+Vec reference_attention(const Vec& q, const std::vector<Vec>& keys, const std::vector<Vec>& values,
+                        const Features& f = {}) {
     const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadSize));
+    const size_t n = keys.size();
+    const size_t first = (f.sliding_window > 0 && n > static_cast<size_t>(f.sliding_window)) ? n - f.sliding_window : 0;
     Vec out(kHidden, 0.0f);
     for (size_t h = 0; h < kHeads; ++h) {
-        std::vector<float> s(keys.size());
+        std::vector<float> s(n, 0.0f);
         float max_s = -INFINITY;
-        for (size_t j = 0; j < keys.size(); ++j) {
+        for (size_t j = first; j < n; ++j) {
             float dot = 0;
             for (size_t d = 0; d < kHeadSize; ++d) dot += q[h * kHeadSize + d] * keys[j][h * kHeadSize + d];
             s[j] = dot * scale;
+            if (!f.alibi_slopes.empty()) s[j] += f.alibi_slopes[h] * -static_cast<float>(n - 1 - j);
             max_s = std::max(max_s, s[j]);
         }
         float sum = 0;
-        for (auto& x : s) sum += (x = std::exp(x - max_s));
-        for (size_t j = 0; j < keys.size(); ++j)
+        for (size_t j = first; j < n; ++j) sum += (s[j] = std::exp(s[j] - max_s));
+        for (size_t j = first; j < n; ++j)
             for (size_t d = 0; d < kHeadSize; ++d) out[h * kHeadSize + d] += s[j] / sum * values[j][h * kHeadSize + d];
     }
     return out;
@@ -162,8 +181,10 @@ ov::Tensor i32_tensor(std::vector<int32_t> v) {
 
 class PagedAttentionPluginTest : public testing::Test {
 protected:
-    void SetUp() override {
-        model_ = make_model();
+    void SetUp() override { compile({}); }
+
+    void compile(const Features& f) {
+        model_ = make_model(f);
         auto plugin = std::make_shared<Plugin>();
         compiled_ = plugin->compile_model(model_, {{ov::device::id.name(), "0"}, {ov::hint::inference_precision.name(), "f32"}});
         request_ = compiled_->create_infer_request();
@@ -297,3 +318,44 @@ TEST_F(PagedAttentionPluginTest, InvalidBlockTableThrows) {
     // block 5 is outside the 2-block cache
     EXPECT_ANY_THROW(step({t}, {t}, {t}, 0, {5}));
 }
+
+class PagedAttentionFeaturesTest : public PagedAttentionPluginTest,
+                                   public testing::WithParamInterface<Features> {};
+
+TEST_P(PagedAttentionFeaturesTest, PrefillAndDecodeMatchReference) {
+    const Features f = GetParam();
+    compile(f);
+    std::mt19937 rng(11);
+    const auto tokens = [&](size_t n) {
+        std::vector<Vec> t(n);
+        for (auto& x : t) x = random_token(rng);
+        return t;
+    };
+    // A 40-token prompt over two blocks, then decode steps across the block boundary region.
+    const size_t prompt = kBlock + 8;
+    auto keys = tokens(prompt), values = tokens(prompt);
+    const auto q1 = tokens(prompt);
+    const auto out1 = step(q1, keys, values, 0, {1, 0});
+    for (size_t r = 0; r < prompt; ++r) {
+        const std::vector<Vec> k(keys.begin(), keys.begin() + r + 1), v(values.begin(), values.begin() + r + 1);
+        expect_near(out1[r], reference_attention(q1[r], k, v, f), "prefill output");
+    }
+    for (int i = 0; i < 3; ++i) {
+        const auto q = tokens(1), k = tokens(1), v = tokens(1);
+        const auto out = step(q, k, v, static_cast<int32_t>(keys.size()), {1, 0});
+        keys.push_back(k[0]);
+        values.push_back(v[0]);
+        expect_near(out[0], reference_attention(q[0], keys, values, f), "decode output");
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(PagedAttention,
+                         PagedAttentionFeaturesTest,
+                         testing::Values(Features{17, {}},                 // Phi-3-like sliding window
+                                         Features{0, {0.5f, 0.0625f}},     // ALiBi (Bloom-like slopes)
+                                         Features{5, {}}),                 // window smaller than a block
+                         [](const testing::TestParamInfo<Features>& info) {
+                             const auto& f = info.param;
+                             return f.alibi_slopes.empty() ? "SlidingWindow" + std::to_string(f.sliding_window)
+                                                           : std::string("Alibi");
+                         });
