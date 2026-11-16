@@ -236,7 +236,7 @@ protected:
 
 TEST_F(PagedAttentionPluginTest, CopyOnWriteAndGrowthStayCoherentWithHostCaches) {
     std::mt19937 rng(7);
-    const auto tokens = [&](size_t n) {
+    const auto tokens = [&rng](size_t n) {
         std::vector<Vec> t(n);
         for (auto& x : t) x = random_token(rng);
         return t;
@@ -289,7 +289,7 @@ TEST_F(PagedAttentionPluginTest, GrowthKeepsFullBlocksOnTheDevice) {
     // A full block is never refreshed from the host (nothing is appended to it), so after the
     // cache grows its contents can only come from the device data kept across the reallocation.
     std::mt19937 rng(5);
-    const auto tokens = [&](size_t n) {
+    const auto tokens = [&rng](size_t n) {
         std::vector<Vec> t(n);
         for (auto& x : t) x = random_token(rng);
         return t;
@@ -326,7 +326,7 @@ TEST_P(PagedAttentionFeaturesTest, PrefillAndDecodeMatchReference) {
     const Features f = GetParam();
     compile(f);
     std::mt19937 rng(11);
-    const auto tokens = [&](size_t n) {
+    const auto tokens = [&rng](size_t n) {
         std::vector<Vec> t(n);
         for (auto& x : t) x = random_token(rng);
         return t;

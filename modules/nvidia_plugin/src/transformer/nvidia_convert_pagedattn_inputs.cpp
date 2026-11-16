@@ -45,8 +45,9 @@ bool ConvertPagedAttnInputs::run_on_model(const std::shared_ptr<ov::Model>& mode
         }
 
         // input 3 = key_cache.N, input 4 = value_cache.N (both v0::Parameter).
-        const auto specialize = [&](std::size_t input_idx, ov::Dimension::value_type heads,
-                                    ov::Dimension::value_type head_size) {
+        const auto specialize = [&pa, &precision, &changed, block_size](std::size_t input_idx,
+                                                                         ov::Dimension::value_type heads,
+                                                                         ov::Dimension::value_type head_size) {
             const auto param = ov::as_type_ptr<ov::op::v0::Parameter>(pa->get_input_node_shared_ptr(input_idx));
             if (!param) {
                 return;

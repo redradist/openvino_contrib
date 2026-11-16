@@ -5,17 +5,83 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstring>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
 #include "cuda/runtime.hpp"
 #include "memory_manager/tensor_types.hpp"
+#include "ops/paged_attention_mapping.hpp"
 #include "openvino/core/except.hpp"
 #include "openvino/runtime/tensor.hpp"
 
 namespace ov {
 namespace nvidia_gpu {
+
+/**
+ * @brief Page-locked host memory for asynchronous copies, handed out linearly during one infer.
+ * Memory handed out stays valid until reset(), which the caller may only invoke once every
+ * copy that uses it has completed.
+ */
+class PinnedArena {
+public:
+    void* allocate(std::size_t bytes) {
+        bytes = (bytes + kAlignment - 1) / kAlignment * kAlignment;
+        if (chunks_.empty() || chunks_.back().size - chunks_.back().used < bytes) {
+            const std::size_t last = chunks_.empty() ? 0 : chunks_.back().size;
+            add_chunk(std::max({bytes, 2 * last, kMinChunk}));
+        }
+        Chunk& c = chunks_.back();
+        void* p = c.data.get() + c.used;
+        c.used += bytes;
+        return p;
+    }
+
+    /**
+     * @brief Makes all memory available again. Several chunks are merged into one big enough for
+     *        all of them, unless that exceeds kMaxRetained: then the memory is released and the
+     *        next infer allocates what it needs.
+     */
+    void reset() noexcept {
+        std::size_t total = 0;
+        for (const auto& c : chunks_) total += c.size;
+        if (chunks_.size() > 1 || total > kMaxRetained) {
+            chunks_.clear();
+            if (total <= kMaxRetained) {
+                try {
+                    add_chunk(total);
+                } catch (...) {
+                    chunks_.clear();  // allocate on demand next time
+                }
+            }
+        }
+        for (auto& c : chunks_) c.used = 0;
+    }
+
+private:
+    static constexpr std::size_t kAlignment = 256;
+    static constexpr std::size_t kMinChunk = std::size_t{1} << 20;
+    static constexpr std::size_t kMaxRetained = std::size_t{64} << 20;
+    struct FreeHost {
+        void operator()(uint8_t* p) const noexcept { ::logIfError(cudaFreeHost(p)); }
+    };
+    struct Chunk {
+        std::unique_ptr<uint8_t, FreeHost> data;
+        std::size_t size = 0;
+        std::size_t used = 0;
+    };
+
+    void add_chunk(std::size_t size) {
+        void* p = nullptr;
+        ::throwIfError(cudaMallocHost(&p, size));
+        chunks_.push_back(Chunk{std::unique_ptr<uint8_t, FreeHost>{static_cast<uint8_t*>(p)}, size, 0});
+    }
+
+    std::vector<Chunk> chunks_;
+};
 
 /**
  * @brief Per-request device mirrors of the paged KV caches (key_cache.N / value_cache.N).
@@ -29,20 +95,30 @@ namespace nvidia_gpu {
  *   After every infer, every slot written by PagedAttention is identical on host and device.
  *
  * It is maintained by
- *  - bind():            growth keeps the device contents (device-to-device copy); a new or
- *                       desynchronized cache is seeded with a full host-to-device upload;
- *  - refresh_blocks():  before a step appends into a partially filled block, that block is
- *                       re-uploaded from the host (it may be a copy-on-write destination);
- *  - write_back():      every block written by a step is downloaded back to the host. The
- *                       copies are deferred and issued by flush() once all kernels have been
- *                       enqueued, before infer() returns (GenAI reads the host tensor on its
- *                       next schedule()).
+ *  - bind():             growth keeps the device contents (device-to-device copy); a new or
+ *                        desynchronized cache is seeded with a full host-to-device upload;
+ *  - refresh_prefixes(): before a step appends into a partially filled block, the filled part
+ *                        of that block is re-uploaded from the host (the block may be a
+ *                        copy-on-write destination);
+ *  - write_back_rows():  the K/V rows a step writes into the cache are downloaded as they are
+ *                        (they are PagedAttention's key/value inputs) and finish_infer() scatters
+ *                        them into the host tensor at their slots, before infer() returns (GenAI
+ *                        reads the host tensor on its next schedule()).
+ * Both copy directions go through page-locked staging memory, so they are asynchronous and
+ * never stall the stream.
  *
  * Owned by CudaInferRequest (so it survives across infer() calls); passed by reference to
  * InferenceRequestContext. All methods are called on the thread that runs the request.
  */
 class PagedAttentionContext {
 public:
+    /// Starts an infer.
+    void begin_infer() {
+        steps_.clear();
+        pending_.clear();
+        staging_.reset();
+    }
+
     /**
      * @brief Binds the device mirror of cache `id` to the host tensor bound for this infer
      *        and returns its device pointer.
@@ -83,8 +159,12 @@ public:
             e.alloc = std::move(alloc);
             e.capacity = capacity;
         }
+        OPENVINO_ASSERT(shape.size() == 4, "PagedAttention: expected a [blocks, heads, block_size, head_size] KV cache");
         e.bytes = bytes;
         e.block_bytes = num_blocks ? bytes / num_blocks : 0;
+        e.heads = shape[1];
+        e.block_size = shape[2];
+        e.row_bytes = shape[3] * host.get_element_type().size();
         e.host = static_cast<uint8_t*>(host.data());
         if (!e.synced) {
             if (bytes > 0) {
@@ -95,50 +175,155 @@ public:
         return e.alloc.get();
     }
 
-    /// Re-uploads the given blocks of cache `id` from the host tensor bound by bind().
-    void refresh_blocks(BufferID id, const std::vector<int32_t>& blocks, const CUDA::Stream& stream) {
+    /**
+     * @brief Re-uploads the first filled[i] slots of block blocks[i] of cache `id` from the
+     *        host tensor bound by bind().
+     */
+    void refresh_prefixes(BufferID id,
+                          const std::vector<int32_t>& blocks,
+                          const std::vector<int32_t>& filled,
+                          const CUDA::Stream& stream) {
+        OPENVINO_ASSERT(blocks.size() == filled.size(), "PagedAttention: refresh blocks/filled size mismatch");
         const Entry& e = entry(id);
-        for_each_run(blocks, [&](int32_t first, int32_t count) {
-            const std::size_t offset = static_cast<std::size_t>(first) * e.block_bytes;
-            const std::size_t size = static_cast<std::size_t>(count) * e.block_bytes;
-            OPENVINO_ASSERT(offset + size <= e.bytes, "PagedAttention: refreshed block is out of the KV cache");
-            stream.upload(CUDA::DevicePointer<void*>{static_cast<uint8_t*>(e.alloc.get()) + offset},
-                          e.host + offset,
-                          size);
-        });
-    }
-
-    /// Schedules the download of the given blocks of cache `id` to its host tensor (see flush()).
-    void write_back(BufferID id, const std::vector<int32_t>& blocks) {
-        const Entry& e = entry(id);
-        for_each_run(blocks, [&](int32_t first, int32_t count) {
-            const std::size_t offset = static_cast<std::size_t>(first) * e.block_bytes;
-            const std::size_t size = static_cast<std::size_t>(count) * e.block_bytes;
-            OPENVINO_ASSERT(offset + size <= e.bytes, "PagedAttention: written block is out of the KV cache");
-            pending_.push_back({e.host + offset, static_cast<const uint8_t*>(e.alloc.get()) + offset, size});
-        });
-    }
-
-    /// Issues the scheduled downloads. Must be called after all kernels of the infer are enqueued.
-    void flush(const CUDA::Stream& stream) {
-        for (const auto& p : pending_) {
-            stream.download(p.host, CUDA::DevicePointer<const void*>{p.device}, p.bytes);
+        for (std::size_t i = 0; i < blocks.size(); ++i) {
+            const std::size_t block = static_cast<std::size_t>(blocks[i]);
+            const std::size_t slots = static_cast<std::size_t>(filled[i]);
+            if (slots == 0) continue;
+            OPENVINO_ASSERT(slots <= e.block_size && (block + 1) * e.block_bytes <= e.bytes,
+                            "PagedAttention: refreshed block is out of the KV cache");
+            // [heads, block_size, row] block: the filled prefix is `slots` rows of every head.
+            const std::size_t width = slots * e.row_bytes;
+            const std::size_t pitch = e.block_size * e.row_bytes;
+            auto* staging = static_cast<uint8_t*>(staging_.allocate(e.heads * width));
+            const uint8_t* src = e.host + block * e.block_bytes;
+            for (std::size_t h = 0; h < e.heads; ++h) {
+                std::memcpy(staging + h * width, src + h * pitch, width);
+            }
+            ::throwIfError(cudaMemcpy2DAsync(static_cast<uint8_t*>(e.alloc.get()) + block * e.block_bytes,
+                                                 pitch,
+                                                 staging,
+                                                 width,
+                                                 width,
+                                                 e.heads,
+                                                 cudaMemcpyHostToDevice,
+                                                 stream.get()));
         }
-        pending_.clear();
     }
 
     /**
-     * @brief Marks every device mirror as not matching its host tensor (an infer failed or was
-     *        cancelled half-way). The next bind() re-seeds it with a full upload.
+     * @brief Schedules the write-back of the rows a step writes into cache `id`.
+     * @param device_rows  the step's new K or V rows, [slot_mapping.size(), heads, row] on the device
+     * @param slot_mapping the cache slot of every row (-1 = not written)
+     * The rows are downloaded now (stream-ordered) and scattered into the host tensor by
+     * finish_infer().
      */
-    void mark_desynced() {
+    void write_back_rows(BufferID id,
+                         const void* device_rows,
+                         const std::vector<int32_t>& slot_mapping,
+                         const CUDA::Stream& stream) {
+        const Entry& e = entry(id);
+        const std::size_t bytes = slot_mapping.size() * e.heads * e.row_bytes;
+        if (bytes == 0) return;
+        void* staging = staging_.allocate(bytes);
+        ::throwIfError(cudaMemcpyAsync(staging, device_rows, bytes, cudaMemcpyDeviceToHost, stream.get()));
+        pending_.push_back(PendingRows{e.host, e.bytes, e.block_bytes, e.block_size, e.heads, e.row_bytes,
+                                       static_cast<const uint8_t*>(staging), slot_mapping});
+    }
+
+    /**
+     * @brief Completes an infer whose stream has been synchronized: writes the downloaded rows
+     *        into the host tensors and releases the per-infer data.
+     */
+    void finish_infer() {
+        for (const auto& p : pending_) {
+            for (std::size_t t = 0; t < p.slots.size(); ++t) {
+                if (p.slots[t] < 0) continue;
+                const std::size_t block = static_cast<std::size_t>(p.slots[t]) / p.block_size;
+                const std::size_t offset = static_cast<std::size_t>(p.slots[t]) % p.block_size;
+                OPENVINO_ASSERT((block + 1) * p.block_bytes <= p.host_bytes,
+                                "PagedAttention: written slot is out of the KV cache");
+                uint8_t* dst = p.host + block * p.block_bytes + offset * p.row_bytes;
+                const uint8_t* src = p.rows + t * p.heads * p.row_bytes;
+                for (std::size_t h = 0; h < p.heads; ++h) {
+                    std::memcpy(dst + h * p.block_size * p.row_bytes, src + h * p.row_bytes, p.row_bytes);
+                }
+            }
+        }
+        pending_.clear();
+        staging_.reset();
+        steps_.clear();
+    }
+
+    /**
+     * @brief Ends an infer that failed or was cancelled half-way on `stream`.
+     *
+     * Waits for the work the infer already enqueued (copies into and out of the staging memory,
+     * kernels writing the device mirrors): the next infer of the request may run on another
+     * stream. The pending write-back is dropped, so every device mirror is marked as not matching
+     * its host tensor; the next bind() re-seeds it with a full upload.
+     */
+    void abort_infer(const CUDA::Stream& stream) noexcept {
+        // Errors are only logged: the caller is propagating the exception that aborted the infer.
+        ::logIfError(cudaStreamSynchronize(stream.get()));
         for (auto& kv : caches_) {
             kv.second.synced = false;
         }
         pending_.clear();
+        steps_.clear();
+        staging_.reset();
     }
 
     bool empty() const { return caches_.empty(); }
+
+    /**
+     * @brief Scheduling data of one infer, shared by all PagedAttention layers that read the
+     *        same scheduling inputs (normally all of them): the host-side mapping and its
+     *        device copies.
+     */
+    struct StepData {
+        PagedAttentionMapping mapping;
+        CUDA::Allocation slot_mapping;   ///< device copy of mapping.slot_mapping
+        CUDA::Allocation row_to_subseq;  ///< device copy of mapping.row_to_subseq
+    };
+
+    /// Identifies the scheduling inputs of a layer within one infer: the host tensors of
+    /// past_lens, subsequence_begins, block_indices, block_indices_begins, plus the step's
+    /// token count and the number of blocks of the bound cache.
+    struct StepKey {
+        std::array<const void*, 4> metadata;
+        int num_tokens;
+        int64_t num_cache_blocks;
+        bool operator==(const StepKey& o) const {
+            return metadata == o.metadata && num_tokens == o.num_tokens && num_cache_blocks == o.num_cache_blocks;
+        }
+    };
+
+    /// Uploads `mapping` to the device; the result is valid for the current infer.
+    static std::unique_ptr<StepData> make_step_data(PagedAttentionMapping mapping, const CUDA::Stream& stream) {
+        const std::size_t bytes = std::max<std::size_t>(mapping.slot_mapping.size() * sizeof(int32_t), 1);
+        auto slot = stream.malloc(bytes);
+        auto r2s = stream.malloc(bytes);
+        auto data = std::unique_ptr<StepData>(new StepData{std::move(mapping), std::move(slot), std::move(r2s)});
+        const std::size_t n = data->mapping.slot_mapping.size() * sizeof(int32_t);
+        if (n) {
+            stream.upload(CUDA::DevicePointer<void*>{data->slot_mapping.get()}, data->mapping.slot_mapping.data(), n);
+            stream.upload(CUDA::DevicePointer<void*>{data->row_to_subseq.get()}, data->mapping.row_to_subseq.data(), n);
+        }
+        return data;
+    }
+
+    /// The step data registered for `key` during the current infer, or nullptr.
+    const StepData* find_step(const StepKey& key) const {
+        for (const auto& s : steps_) {
+            if (s.first == key) return s.second.get();
+        }
+        return nullptr;
+    }
+
+    const StepData& add_step(const StepKey& key, std::unique_ptr<StepData> data) {
+        steps_.emplace_back(key, std::move(data));
+        return *steps_.back().second;
+    }
 
 private:
     struct Entry {
@@ -146,13 +331,21 @@ private:
         std::size_t capacity = 0;     ///< allocated device bytes
         std::size_t bytes = 0;        ///< bytes of the currently bound host tensor
         std::size_t block_bytes = 0;  ///< bytes of one cache block
+        std::size_t heads = 0;        ///< KV heads (dim 1)
+        std::size_t block_size = 0;   ///< slots per block (dim 2)
+        std::size_t row_bytes = 0;    ///< bytes of one slot of one head (dim 3)
         uint8_t* host = nullptr;      ///< data of the currently bound host tensor
         bool synced = false;          ///< device holds every slot written on the host
     };
-    struct PendingDownload {
-        void* host;
-        const void* device;
-        std::size_t bytes;
+    struct PendingRows {
+        uint8_t* host;
+        std::size_t host_bytes;
+        std::size_t block_bytes;
+        std::size_t block_size;
+        std::size_t heads;
+        std::size_t row_bytes;
+        const uint8_t* rows;  ///< staging copy of the rows, [slots.size(), heads, row_bytes]
+        std::vector<int32_t> slots;
     };
 
     const Entry& entry(BufferID id) const {
@@ -161,21 +354,10 @@ private:
         return it->second;
     }
 
-    /// Calls fn(first, count) for every run of consecutive block ids in a sorted list.
-    template <typename Fn>
-    static void for_each_run(const std::vector<int32_t>& sorted_blocks, Fn&& fn) {
-        for (std::size_t i = 0; i < sorted_blocks.size();) {
-            std::size_t j = i + 1;
-            while (j < sorted_blocks.size() && sorted_blocks[j] == sorted_blocks[j - 1] + 1) {
-                ++j;
-            }
-            fn(sorted_blocks[i], static_cast<int32_t>(j - i));
-            i = j;
-        }
-    }
-
     std::unordered_map<BufferID, Entry> caches_;
-    std::vector<PendingDownload> pending_;
+    std::vector<PendingRows> pending_;
+    std::vector<std::pair<StepKey, std::unique_ptr<StepData>>> steps_;
+    PinnedArena staging_;
 };
 
 }  // namespace nvidia_gpu

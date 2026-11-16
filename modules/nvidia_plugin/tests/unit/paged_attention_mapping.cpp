@@ -18,7 +18,6 @@ TEST(PagedAttentionMapping, SinglePrefillFromEmptyCache) {
     const auto m = build_paged_attention_mapping(6, kBlock, V{0}, V{0, 6}, V{7, 2}, V{0, 2});
     EXPECT_EQ(m.slot_mapping, (V{28, 29, 30, 31, 8, 9}));
     EXPECT_EQ(m.row_to_subseq, (V{0, 0, 0, 0, 0, 0}));
-    EXPECT_EQ(m.write_blocks, (V{2, 7}));
     EXPECT_TRUE(m.refresh_blocks.empty());  // writes start at offset 0
 }
 
@@ -26,8 +25,8 @@ TEST(PagedAttentionMapping, DecodeIntoPartiallyFilledBlockNeedsRefresh) {
     // past 5 -> position 5 is offset 1 of the 2nd block (id 3), which already holds position 4.
     const auto m = build_paged_attention_mapping(1, kBlock, V{5}, V{0, 1}, V{9, 3}, V{0, 2});
     EXPECT_EQ(m.slot_mapping, (V{13}));
-    EXPECT_EQ(m.write_blocks, (V{3}));
     EXPECT_EQ(m.refresh_blocks, (V{3}));
+    EXPECT_EQ(m.refresh_filled, (V{1}));
 }
 
 TEST(PagedAttentionMapping, DecodeAtBlockBoundaryNeedsNoRefresh) {
@@ -48,20 +47,21 @@ TEST(PagedAttentionMapping, MixedBatchWithSharedAndPermutedBlocks) {
                                                  V{0, 2, 4, 7});
     EXPECT_EQ(m.slot_mapping, (V{1 * 4 + 2, 3 * 4 + 2, 3 * 4 + 3, 8 * 4 + 0, 6 * 4 + 0}));
     EXPECT_EQ(m.row_to_subseq, (V{0, 1, 1, 1, 2}));
-    EXPECT_EQ(m.write_blocks, (V{1, 3, 6, 8}));
     EXPECT_EQ(m.refresh_blocks, (V{1, 3}));
+    EXPECT_EQ(m.refresh_filled, (V{2, 2}));
 }
 
 TEST(PagedAttentionMapping, SequenceWithoutNewTokensIsIgnored) {
     const auto m = build_paged_attention_mapping(1, kBlock, V{3, 5}, V{0, 0, 1}, V{2, 3, 4}, V{0, 1, 3});
     EXPECT_EQ(m.slot_mapping, (V{4 * 4 + 1}));
     EXPECT_EQ(m.refresh_blocks, (V{4}));
+    EXPECT_EQ(m.refresh_filled, (V{1}));
 }
 
 TEST(PagedAttentionMapping, NegativeBlockIdsAreNotWritten) {
     const auto m = build_paged_attention_mapping(2, kBlock, V{0}, V{0, 2}, V{-1}, V{0, 1});
     EXPECT_EQ(m.slot_mapping, (V{-1, -1}));
-    EXPECT_TRUE(m.write_blocks.empty());
+    EXPECT_TRUE(m.refresh_blocks.empty());
 }
 
 TEST(PagedAttentionMapping, InvalidMetadataThrows) {

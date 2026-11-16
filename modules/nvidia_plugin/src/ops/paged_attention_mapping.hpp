@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <map>
 #include <vector>
 
 #include "openvino/core/except.hpp"
@@ -23,22 +24,15 @@ struct PagedAttentionMapping {
     std::vector<int32_t> slot_mapping;
     /// Subsequence index of each query row.
     std::vector<int32_t> row_to_subseq;
-    /// Distinct physical blocks written this step (sorted). They must be written back to the
-    /// host cache tensor so the host stays the source of truth.
-    std::vector<int32_t> write_blocks;
     /// Distinct physical blocks that are appended to at a non-zero in-block offset (sorted).
     /// Their already-filled prefix may have been produced outside the model (e.g. GenAI's
-    /// copy-on-write `copy_blocks` on the host tensor), so they must be refreshed from the
+    /// copy-on-write `copy_blocks` on the host tensor), so it must be refreshed from the
     /// host before this step writes into them.
     std::vector<int32_t> refresh_blocks;
+    /// Number of already-filled slots of each refresh_blocks entry (the prefix to refresh).
+    std::vector<int32_t> refresh_filled;
 };
 
-namespace paged_attention_detail {
-inline void sort_unique(std::vector<int32_t>& v) {
-    std::sort(v.begin(), v.end());
-    v.erase(std::unique(v.begin(), v.end()), v.end());
-}
-}  // namespace paged_attention_detail
 
 /**
  * @brief Builds and validates the per-step mapping.
@@ -74,10 +68,11 @@ inline PagedAttentionMapping build_paged_attention_mapping(int num_tokens,
                     "PagedAttention: block_indices_begins is out of range of block_indices");
 
     PagedAttentionMapping m;
+    std::map<int32_t, int32_t> refresh;  // block -> filled slots, sorted by block
     m.slot_mapping.assign(num_tokens, -1);
     m.row_to_subseq.assign(num_tokens, -1);
 
-    const auto check_block = [&](int32_t bn) {
+    const auto check_block = [num_cache_blocks](int32_t bn) {
         OPENVINO_ASSERT(num_cache_blocks < 0 || bn < num_cache_blocks,
                         "PagedAttention: block index ",
                         bn,
@@ -123,7 +118,6 @@ inline PagedAttentionMapping build_paged_attention_mapping(int num_tokens,
             }
             check_block(bn);
             m.slot_mapping[row] = bn * block_size + (pos % block_size);
-            m.write_blocks.push_back(bn);
         }
 
         // The block this subsequence appends into already holds `past % block_size` tokens.
@@ -133,12 +127,15 @@ inline PagedAttentionMapping build_paged_attention_mapping(int num_tokens,
             const int32_t bn = block_indices[blk];
             if (bn >= 0) {
                 check_block(bn);
-                m.refresh_blocks.push_back(bn);
+                int32_t& filled = refresh[bn];
+                filled = std::max(filled, past % block_size);
             }
         }
     }
-    paged_attention_detail::sort_unique(m.write_blocks);
-    paged_attention_detail::sort_unique(m.refresh_blocks);
+    for (const auto& [block, filled] : refresh) {
+        m.refresh_blocks.push_back(block);
+        m.refresh_filled.push_back(filled);
+    }
     return m;
 }
 

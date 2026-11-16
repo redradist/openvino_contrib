@@ -180,6 +180,7 @@ void CudaInferRequest::start_pipeline(const ThreadContext& threadContext) {
         // Always provide the paged-attention cache store; PagedAttention execution
         // lazily allocates per-cache device buffers into it (persists across infers).
         inferRequestContext.setPagedAttentionContext(paged_attention_context_);
+        paged_attention_context_.begin_infer();
         topology_runner.UpdateContext(inferRequestContext, memory);
         topology_runner.Run(inferRequestContext, memory);
         executionDelegator_->stop_stage(PerfStages::StartPipeline);
@@ -187,7 +188,7 @@ void CudaInferRequest::start_pipeline(const ThreadContext& threadContext) {
         // TODO:
         // Log error once logger is available
         // Some layers may have updated their device KV caches without the host write-back.
-        paged_attention_context_.mark_desynced();
+        paged_attention_context_.abort_infer(threadContext.stream());
         memory_proxy_.reset();
         throw;
     }
@@ -197,13 +198,13 @@ void CudaInferRequest::wait_pipeline(const ThreadContext& threadContext) {
     OV_ITT_SCOPED_TASK(itt::domains::nvidia_gpu, _profilingTask[PerfStages::WaitPipeline])
     executionDelegator_->start_stage();
     try {
-        // Write the KV cache blocks updated by PagedAttention back to GenAI's host tensors.
-        // This must complete before infer() returns: GenAI reads them on its next schedule().
-        paged_attention_context_.flush(threadContext.stream());
         // TODO: probably all time will be spent in synchonize, out of reach of ThrowIfCanceled
         threadContext.stream().synchronize();
+        // Write the KV cache rows written by PagedAttention back to GenAI's host tensors.
+        // This must complete before infer() returns: GenAI reads them on its next schedule().
+        paged_attention_context_.finish_infer();
     } catch (...) {
-        paged_attention_context_.mark_desynced();
+        paged_attention_context_.abort_infer(threadContext.stream());
         memory_proxy_.reset();
         throw;
     }

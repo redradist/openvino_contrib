@@ -291,6 +291,10 @@ private:
         std::optional<std::vector<float>> alibi_slopes;
     };
     PagedAttentionConstants pa_constants_;
+    // Device copy of pa_constants_.alibi_slopes, uploaded once on first use (shared by the
+    // infer requests of the compiled model).
+    mutable std::once_flag pa_alibi_once_;
+    mutable std::optional<CUDA::DefaultAllocation> pa_alibi_device_;
 
     // Probe, at construction, whether the output shape is value-dependent.
     bool computeHasDynamicOutput() const;
