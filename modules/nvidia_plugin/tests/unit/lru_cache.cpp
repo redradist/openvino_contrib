@@ -46,16 +46,3 @@ TEST(LruCache, CyclicAccessHitsWhenCapacityCoversAllKeys) {
         }
     }
 }
-
-TEST(LruCache, SetCapacityGrowsAndShrinks) {
-    LruCache<int, int> cache{2};
-    cache.set_capacity(4);
-    for (int k = 0; k < 4; ++k) cache.insert(k, k);
-    EXPECT_EQ(cache.size(), 4u);
-    cache.find(0);
-    cache.set_capacity(2);  // keeps the two most recently used: 0 and 3
-    EXPECT_EQ(cache.size(), 2u);
-    EXPECT_NE(cache.find(0), nullptr);
-    EXPECT_NE(cache.find(3), nullptr);
-    EXPECT_EQ(cache.find(1), nullptr);
-}

@@ -139,13 +139,17 @@ void CompiledModel::compile_model(const std::shared_ptr<const ov::Model>& model)
     } else {
         topology_runner_ = std::make_unique<EagerTopologyRunner>(creationContext, model_);
     }
-    // Size the shape cache of the dynamic operations so that one inference never evicts entries
-    // it is about to use again (see DynamicOperationCache).
-    const auto& exec_sequence = topology_runner_->GetSubGraph().getExecSequence();
+    // Bound the cache of per-shape instances of the dynamic operations by the model: entries per
+    // dynamic operation, device memory by the device memory of the constants (see DynamicOperationCache).
+    const auto& subgraph = topology_runner_->GetSubGraph();
+    const auto& exec_sequence = subgraph.getExecSequence();
     const auto num_dynamic_ops = std::count_if(exec_sequence.begin(), exec_sequence.end(), [](const auto& op) {
         return dynamic_cast<const DynamicOperation*>(op.get()) != nullptr;
     });
-    dynamic_op_cache_.reserve(static_cast<size_t>(num_dynamic_ops));
+    const auto constant_bytes = subgraph.memoryManager()->immutableTensors().memoryModel()->deviceMemoryBlockSize();
+    dynamic_op_cache_.configure(static_cast<size_t>(num_dynamic_ops),
+                                constant_bytes,
+                                config_.get(ov::nvidia_gpu::dynamic_operation_cache_capacity.name()).as<size_t>());
 
     memory_pool_ = create_memory_pool();
 }

@@ -6,39 +6,45 @@
 
 #include <algorithm>
 #include <functional>
-#include <list>
-#include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace ov {
 namespace nvidia_gpu {
 
 /**
- * @brief Generic LRU (Least Recently Used) cache with O(1) lookup, insertion and eviction.
+ * @brief Generic LRU (Least Recently Used) cache backed by a flat vector.
  *
- * Entries live in a list ordered from most to least recently used; a hash map indexes them.
- * When the capacity is exceeded, the least recently used entry is evicted.
+ * For small capacities (typical: 8) linear scan over contiguous memory
+ * is faster than std::unordered_map + std::list due to cache locality
+ * and zero heap allocations per operation.
+ *
+ * Most recently accessed items are at the front of the vector.
+ * When capacity is exceeded, the least recently used (back) item is evicted.
  *
  * @tparam Key   Cache key type (must support operator==)
  * @tparam Value Cached value type
- * @tparam Hash  Hash functor for Key
+ * @tparam Hash  Unused, kept for API compatibility
  */
 template <typename Key, typename Value, typename Hash = std::hash<Key>>
 class LruCache {
 public:
-    explicit LruCache(size_t capacity) : capacity_{std::max<size_t>(capacity, 1)} {}
+    explicit LruCache(size_t capacity) : capacity_{std::max<size_t>(capacity, 1)} {
+        entries_.reserve(capacity_);
+    }
 
     /**
      * Find a cached value by key.
-     * If found, promotes the entry to most-recently-used.
+     * If found, promotes the entry to most-recently-used (front).
      * @return Pointer to cached value, or nullptr on miss.
      */
     Value* find(const Key& key) {
-        auto it = index_.find(key);
-        if (it == index_.end()) {
+        auto it = std::find_if(entries_.begin(), entries_.end(),
+                               [&key](const auto& e) { return e.first == key; });
+        if (it == entries_.end()) {
             return nullptr;
         }
-        entries_.splice(entries_.begin(), entries_, it->second);
+        promote(it);
         return &entries_.front().second;
     }
 
@@ -48,46 +54,39 @@ public:
      * @return Reference to the stored value.
      */
     Value& insert(const Key& key, Value value) {
-        auto it = index_.find(key);
-        if (it != index_.end()) {
-            it->second->second = std::move(value);
-            entries_.splice(entries_.begin(), entries_, it->second);
+        auto it = std::find_if(entries_.begin(), entries_.end(),
+                               [&key](const auto& e) { return e.first == key; });
+        if (it != entries_.end()) {
+            it->second = std::move(value);
+            promote(it);
             return entries_.front().second;
         }
-        while (entries_.size() >= capacity_) {
-            evict_lru();
+
+        // Evict LRU if at capacity
+        if (entries_.size() >= capacity_) {
+            entries_.pop_back();
         }
-        entries_.emplace_front(key, std::move(value));
-        index_.emplace(key, entries_.begin());
+
+        // Insert at front
+        entries_.emplace(entries_.begin(), key, std::move(value));
         return entries_.front().second;
     }
 
-    /// Changes the capacity; shrinking evicts the least recently used entries.
-    void set_capacity(size_t capacity) {
-        capacity_ = std::max<size_t>(capacity, 1);
-        while (entries_.size() > capacity_) {
-            evict_lru();
+    size_t size() const { return entries_.size(); }
+
+    void clear() { entries_.clear(); }
+
+private:
+    using Iterator = typename std::vector<std::pair<Key, Value>>::iterator;
+
+    void promote(Iterator it) {
+        if (it != entries_.begin()) {
+            std::rotate(entries_.begin(), it, it + 1);
         }
     }
 
-    size_t capacity() const { return capacity_; }
-
-    size_t size() const { return entries_.size(); }
-
-    void clear() {
-        index_.clear();
-        entries_.clear();
-    }
-
-private:
-    void evict_lru() {
-        index_.erase(entries_.back().first);
-        entries_.pop_back();
-    }
-
-    size_t capacity_;
-    std::list<std::pair<Key, Value>> entries_;
-    std::unordered_map<Key, typename std::list<std::pair<Key, Value>>::iterator, Hash> index_;
+    const size_t capacity_;
+    std::vector<std::pair<Key, Value>> entries_;
 };
 
 }  // namespace nvidia_gpu

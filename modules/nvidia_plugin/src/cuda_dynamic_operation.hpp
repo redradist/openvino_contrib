@@ -4,12 +4,18 @@
 
 #pragma once
 
+#include <cuda_runtime_api.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
+#include <unordered_map>
+#include <vector>
 
 #include "cuda_creation_context.hpp"
 #include "cuda_operation_base.hpp"
-#include "utils/lru_cache.hpp"
 
 namespace ov {
 namespace op {
@@ -78,86 +84,233 @@ struct CachedOperation {
 };
 
 /**
- * @brief Global LRU cache for dynamic shape operations.
+ * @brief LRU cache of the per-shape instances of the dynamic operations of one compiled model.
  *
- * Shared across all DynamicOperation instances within a CompiledModel, so the
- * plugin holds a single bounded cache for the whole model instead of one cache
- * per operation. Uses a composite key (operation identity + input shapes/values)
- * and double-checked locking in getOrCreate().
+ * Shared across all DynamicOperation instances within a CompiledModel, so the plugin holds a
+ * single bounded cache for the whole model instead of one cache per operation. Entries (operation
+ * identity + input shapes/values) live in a vector; a hash index maps the hash of a key to the
+ * slots that hold it, so a hit neither copies the key nor scans the entries. Every lookup stamps
+ * its entry from one model-wide clock; eviction removes the entry with the oldest stamp.
  *
- * Every dynamic operation looks up its entry on every inference, so the capacity must cover
- * all of them: with fewer entries than operations, an LRU cache evicts each entry right before
- * it is needed again and every inference re-creates every operation. The compiled model
- * therefore sizes the cache to kEntriesPerOperation entries per dynamic operation (see
- * reserve()), which keeps several input shapes per operation (e.g. a decode step and a few
- * prefill lengths of an LLM). The total stays bounded by max(kMinEntriesPerOperation entries
- * per operation, kMaxCapacity).
+ * Bounds:
+ *  - capacity (number of entries): every dynamic operation looks up its entry on every
+ *    inference, so a capacity below the number of operations would evict each entry right before
+ *    it is needed again. By default the compiled model allows kEntriesPerOperation entries per
+ *    dynamic operation, i.e. the instances of about that many different input shapes (prompt
+ *    lengths of an LLM) for the whole model; ov::nvidia_gpu::dynamic_operation_cache_capacity
+ *    overrides it. An instance costs ~1-2 KB of host memory (GPT-2, bloom-560m).
+ *  - device memory: instances own device memory (their immutable workbuffers); the total is
+ *    bounded by max(model constants / kConstantsPerDeviceBudget, kMinDeviceBudget).
+ *  - out of device memory while creating an instance: the least recently used entry is evicted
+ *    and the creation retried, until the cache is empty.
+ * An evicted instance is re-created when its shape comes back, so a model whose working set does
+ * not fit keeps running, only slower. An instance that an inference is executing stays alive
+ * through its shared_ptr until the inference is done with it.
  */
 class DynamicOperationCache {
 public:
     static constexpr size_t kDefaultCapacity = 300;
-    static constexpr size_t kEntriesPerOperation = 8;
-    static constexpr size_t kMinEntriesPerOperation = 2;
-    static constexpr size_t kMaxCapacity = 8192;
+    static constexpr size_t kEntriesPerOperation = 32;
+    static constexpr size_t kConstantsPerDeviceBudget = 4;
+    static constexpr size_t kMinDeviceBudget = size_t{64} << 20;
 
-    explicit DynamicOperationCache(size_t capacity = kDefaultCapacity) : cache_{capacity} {}
+    explicit DynamicOperationCache(size_t capacity = kDefaultCapacity) : capacity_{std::max<size_t>(capacity, 1)} {}
 
-    /// Grows the capacity for a model with `num_operations` dynamic operations: kEntriesPerOperation
-    /// entries each, bounded by max(kMinEntriesPerOperation entries each, kMaxCapacity).
-    void reserve(size_t num_operations) {
-        const size_t bound = std::max(num_operations * kMinEntriesPerOperation, kMaxCapacity);
-        const size_t wanted = std::min(num_operations * kEntriesPerOperation, bound);
+    /// Sizes the cache for a model with `num_operations` dynamic operations whose constant tensors
+    /// take `constant_bytes` of device memory. `capacity` == 0 selects kEntriesPerOperation entries
+    /// per operation.
+    void configure(size_t num_operations, size_t constant_bytes, size_t capacity) {
+        std::vector<std::shared_ptr<CachedOperation>> evicted;  // released after unlocking
         std::lock_guard<std::mutex> lock{mutex_};
-        cache_.set_capacity(std::max(cache_.capacity(), wanted));
+        capacity_ = std::max<size_t>(capacity != 0 ? capacity : num_operations * kEntriesPerOperation, 1);
+        device_budget_ = std::max(constant_bytes / kConstantsPerDeviceBudget, kMinDeviceBudget);
+        entries_.reserve(std::min(capacity_, num_operations * kEntriesPerOperation));
+        shrink(nullptr, evicted);
+    }
+
+    void set_capacity(size_t capacity) {
+        std::vector<std::shared_ptr<CachedOperation>> evicted;
+        std::lock_guard<std::mutex> lock{mutex_};
+        capacity_ = std::max<size_t>(capacity, 1);
+        shrink(nullptr, evicted);
+    }
+
+    void set_device_budget(size_t bytes) {
+        std::vector<std::shared_ptr<CachedOperation>> evicted;
+        std::lock_guard<std::mutex> lock{mutex_};
+        device_budget_ = bytes;
+        shrink(nullptr, evicted);
     }
 
     size_t capacity() {
         std::lock_guard<std::mutex> lock{mutex_};
-        return cache_.capacity();
+        return capacity_;
     }
 
+    size_t device_budget() {
+        std::lock_guard<std::mutex> lock{mutex_};
+        return device_budget_;
+    }
+
+    /// Device memory held by the cached instances.
+    size_t device_bytes() {
+        std::lock_guard<std::mutex> lock{mutex_};
+        return device_bytes_;
+    }
+
+    size_t size() {
+        std::lock_guard<std::mutex> lock{mutex_};
+        return entries_.size();
+    }
+
+    /**
+     * Returns the instance of operation `op_id` for `key`, creating it with `factory()` on a miss
+     * (outside the lock, so other operations proceed meanwhile).
+     */
     template <typename Factory>
     std::shared_ptr<CachedOperation> getOrCreate(const void* op_id, const ShapeKey& key, Factory factory) {
-        OperationShapeKey gkey{op_id, key};
+        const size_t hash = hashOf(op_id, key);
         {
             std::lock_guard<std::mutex> lock{mutex_};
-            auto* found = cache_.find(gkey);
-            if (found) {
-                return *found;
+            const size_t slot = find(op_id, key, hash);
+            if (slot != kNone) {
+                entries_[slot].last_use = ++clock_;
+                return entries_[slot].operation;
             }
         }
-        auto op = factory();
-        {
-            std::lock_guard<std::mutex> lock{mutex_};
-            auto* found = cache_.find(gkey);
-            if (found) {
-                return *found;
-            }
-            return cache_.insert(gkey, std::move(op));
+        std::shared_ptr<CachedOperation> created = create(factory);
+        // Declared before the lock: evicted instances free their device memory after unlocking.
+        std::vector<std::shared_ptr<CachedOperation>> evicted;
+        std::lock_guard<std::mutex> lock{mutex_};
+        const size_t slot = find(op_id, key, hash);
+        if (slot != kNone) {  // created meanwhile by another inference
+            entries_[slot].last_use = ++clock_;
+            return entries_[slot].operation;
         }
+        const size_t bytes = deviceBytesOf(*created);
+        entries_.push_back(Entry{op_id, key, hash, created, bytes, ++clock_});
+        index_.emplace(hash, entries_.size() - 1);
+        device_bytes_ += bytes;
+        shrink(created.get(), evicted);
+        return created;
     }
 
 private:
-    struct OperationShapeKey {
+    static constexpr size_t kNone = static_cast<size_t>(-1);
+
+    struct Entry {
         const void* op_id;
-        ShapeKey shape_key;
-
-        bool operator==(const OperationShapeKey& other) const {
-            return op_id == other.op_id && shape_key == other.shape_key;
-        }
+        ShapeKey key;
+        size_t hash;
+        std::shared_ptr<CachedOperation> operation;
+        size_t device_bytes;
+        uint64_t last_use;
     };
 
-    struct OperationShapeKeyHash {
-        size_t operator()(const OperationShapeKey& key) const {
-            size_t seed = std::hash<const void*>{}(key.op_id);
-            ShapeKeyHash shape_hash;
-            seed ^= shape_hash(key.shape_key) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-            return seed;
+    static size_t hashOf(const void* op_id, const ShapeKey& key) {
+        size_t seed = std::hash<const void*>{}(op_id);
+        seed ^= ShapeKeyHash{}(key) + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        return seed;
+    }
+
+    static size_t deviceBytesOf(const CachedOperation& operation) {
+        size_t bytes = 0;
+        for (size_t size : operation.workbuffer_request.immutable_sizes) {
+            bytes += std::max(size, size_t{1});
         }
-    };
+        return bytes;
+    }
+
+    size_t find(const void* op_id, const ShapeKey& key, size_t hash) const {
+        const auto range = index_.equal_range(hash);
+        for (auto it = range.first; it != range.second; ++it) {
+            const Entry& entry = entries_[it->second];
+            if (entry.op_id == op_id && entry.key == key) {
+                return it->second;
+            }
+        }
+        return kNone;
+    }
+
+    /// Makes the index entry (hash -> from) point to `to`, or removes it when `to` is kNone.
+    void reindex(size_t hash, size_t from, size_t to) {
+        const auto range = index_.equal_range(hash);
+        for (auto it = range.first; it != range.second; ++it) {
+            if (it->second == from) {
+                if (to == kNone) {
+                    index_.erase(it);
+                } else {
+                    it->second = to;
+                }
+                return;
+            }
+        }
+    }
+
+    template <typename Factory>
+    std::shared_ptr<CachedOperation> create(Factory& factory) {
+        while (true) {
+            try {
+                return factory();
+            } catch (...) {
+                // CUDA records the error of the failed call; an out-of-memory error is not sticky.
+                if (cudaGetLastError() != cudaErrorMemoryAllocation) {
+                    throw;
+                }
+                std::shared_ptr<CachedOperation> victim;
+                {
+                    std::lock_guard<std::mutex> lock{mutex_};
+                    victim = evictLeastRecentlyUsed(nullptr);
+                }
+                if (!victim) {
+                    throw;
+                }
+            }  // `victim` frees its device memory here unless an inference still executes it
+        }
+    }
+
+    /// Evicts least recently used entries (never `keep`) until the bounds hold.
+    void shrink(const CachedOperation* keep, std::vector<std::shared_ptr<CachedOperation>>& evicted) {
+        while (entries_.size() > capacity_ || device_bytes_ > device_budget_) {
+            auto victim = evictLeastRecentlyUsed(keep);
+            if (!victim) {
+                break;  // only `keep` is left: it is needed right now
+            }
+            evicted.push_back(std::move(victim));
+        }
+    }
+
+    /// Removes the least recently used entry except the one of `keep`; nullptr when there is none.
+    std::shared_ptr<CachedOperation> evictLeastRecentlyUsed(const CachedOperation* keep) {
+        size_t victim = kNone;
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (entries_[i].operation.get() != keep &&
+                (victim == kNone || entries_[i].last_use < entries_[victim].last_use)) {
+                victim = i;
+            }
+        }
+        if (victim == kNone) {
+            return nullptr;
+        }
+        std::shared_ptr<CachedOperation> operation = std::move(entries_[victim].operation);
+        device_bytes_ -= entries_[victim].device_bytes;
+        reindex(entries_[victim].hash, victim, kNone);
+        const size_t last = entries_.size() - 1;
+        if (victim != last) {  // move the last entry into the hole
+            reindex(entries_[last].hash, last, victim);
+            entries_[victim] = std::move(entries_[last]);
+        }
+        entries_.pop_back();
+        return operation;
+    }
 
     std::mutex mutex_;
-    LruCache<OperationShapeKey, std::shared_ptr<CachedOperation>, OperationShapeKeyHash> cache_;
+    std::vector<Entry> entries_;
+    std::unordered_multimap<size_t, size_t> index_;  // hash of the key -> slot in entries_
+    uint64_t clock_ = 0;
+    size_t capacity_;
+    size_t device_bytes_ = 0;
+    size_t device_budget_ = kMinDeviceBudget;
 };
 
 /**
