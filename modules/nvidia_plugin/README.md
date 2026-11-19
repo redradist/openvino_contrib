@@ -181,6 +181,7 @@ Please refer to OpenVINO documentation for details.
 ### Plugin specific parameters
 * `ov::nvidia_gpu::operation_benchmark` - specifies if operation level benchmark should be run for increasing performance of network (`false` by default)
 * `ov::nvidia_gpu::use_cuda_graph` - specifies if NVIDIA plugin attempts to use CUDA Graph feature to speed up sequential network inferences (`true` by default)
+* `ov::nvidia_gpu::dynamic_operation_cache_capacity` - maximum number of per-shape operation instances kept by a model with dynamic shapes (`0` by default: 32 per dynamic operation of the model; least recently used instances are evicted and re-created on demand)
 
 All parameters must be set before calling `ov::Core::compile_model()` in order to take effect.
  

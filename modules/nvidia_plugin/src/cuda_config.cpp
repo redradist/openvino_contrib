@@ -43,6 +43,7 @@ std::vector<ov::PropertyName> Configuration::get_rw_properties() {
         ov::PropertyName{ov::enable_profiling.name(), ov::PropertyMutability::RW},
         ov::PropertyName{ov::nvidia_gpu::operation_benchmark.name(), ov::PropertyMutability::RW},
         ov::PropertyName{ov::nvidia_gpu::use_cuda_graph.name(), ov::PropertyMutability::RW},
+        ov::PropertyName{ov::nvidia_gpu::dynamic_operation_cache_capacity.name(), ov::PropertyMutability::RW},
     };
     return rw_properties;
 }
@@ -163,6 +164,8 @@ Configuration::Configuration(const ov::AnyMap& config, const Configuration& defa
             operation_benchmark = value.as<bool>();
         } else if (ov::nvidia_gpu::use_cuda_graph == key) {
             use_cuda_graph = value.as<bool>();
+        } else if (ov::nvidia_gpu::dynamic_operation_cache_capacity == key) {
+            dynamic_operation_cache_capacity = value.as<size_t>();
         } else if (ov::enable_profiling == key) {
             is_profiling_enabled = value.as<bool>();
         } else if (ov::hint::num_requests == key) {
@@ -199,6 +202,8 @@ ov::Any Configuration::get(const std::string& name) const {
         return operation_benchmark;
     } else if (name == ov::nvidia_gpu::use_cuda_graph) {
         return use_cuda_graph;
+    } else if (name == ov::nvidia_gpu::dynamic_operation_cache_capacity) {
+        return dynamic_operation_cache_capacity;
     } else if (name == ov::num_streams) {
         return (num_streams == 0) ?
             ov::streams::Num(get_optimal_number_of_streams()) : num_streams;

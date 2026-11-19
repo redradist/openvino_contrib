@@ -30,6 +30,13 @@ static constexpr Property<bool, PropertyMutability::RW> operation_benchmark{"NVI
 static constexpr Property<bool, PropertyMutability::RW> use_cuda_graph{"NVIDIA_USE_CUDA_GRAPH"};
 
 /**
+ * @brief Maximum number of per-shape operation instances that a compiled model with dynamic shapes keeps
+ * (0, the default: 32 per dynamic operation of the model). Read when the model is compiled.
+ */
+static constexpr Property<size_t, PropertyMutability::RW> dynamic_operation_cache_capacity{
+    "NVIDIA_DYNAMIC_OPERATION_CACHE_CAPACITY"};
+
+/**
  * @brief Read-only property showing number of used CUDA Graphs
  */
 static constexpr Property<size_t, PropertyMutability::RO> number_of_cuda_graphs{"NVIDIA_NUMBER_OF_CUDA_GRAPHS"};

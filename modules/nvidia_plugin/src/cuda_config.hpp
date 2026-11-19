@@ -52,6 +52,7 @@ private:
     bool is_profiling_enabled = false;
     bool operation_benchmark = false;
     bool use_cuda_graph = true;
+    size_t dynamic_operation_cache_capacity = 0;
     bool exclusive_async_requests = false;
     uint32_t hint_num_requests = 0;
     ov::streams::Num num_streams = 0;
